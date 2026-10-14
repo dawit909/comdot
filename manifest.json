@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Topdown DNS",
-  "version": "2.3",
-  "description": "Navigate using top-down domain structures directly from the address bar.",
+  "name": "comdot",
+  "version": "2.4.0",
+  "description": "Navigate using top-down domain structures.",
   "permissions": [
     "webRequest",
     "webRequestBlocking",
