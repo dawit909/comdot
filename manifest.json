@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "comdot",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Navigate using top-down domain structures.",
   "permissions": [
     "webRequest",
@@ -16,6 +16,18 @@
       "shared.js",
       "background.js"
     ]
+  },
+  "action": {
+    "default_title": "comdot",
+    "default_icon": {
+      "48": "icons/icon-48.png",
+      "96": "icons/icon-96.png"
+    }
+  },
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
   },
   "options_ui": {
     "page": "options.html",
