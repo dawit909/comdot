@@ -1,11 +1,3 @@
-const searchEngines = {
-    "www.google.com": "q",
-    "duckduckgo.com": "q",
-    "www.bing.com": "q",
-    "search.yahoo.com": "p",
-    "ecosia.org": "q"
-};
-
 let customTLDs = { ...defaultCustomTLDs };
 let customMounts = {};
 
@@ -31,6 +23,28 @@ browser.storage.onChanged.addListener((changes, area) => {
     }
 });
 
+// UNIVERSAL SEARCH INTERCEPT: Detects search query parameter across global & self-hosted engines
+function getSearchParam(url) {
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname.toLowerCase();
+
+    if (/(^|\.)google\.[a-z.]+$/.test(host)) return "q";
+    if (/(^|\.)(duckduckgo|bing|kagi|startpage|qwant)\.com$/.test(host)) return "q";
+    if (host === "search.brave.com" || host === "ecosia.org" || host === "www.ecosia.org") return "q";
+    if (/(^|\.)yahoo\.[a-z.]+$/.test(host)) return "p";
+    if (host === "search.naver.com" || host === "search.daum.net") return "query";
+    if (/(^|\.)yandex\.[a-z.]+$/.test(host)) return "text";
+    if (/(^|\.)baidu\.com$/.test(host)) return "wd";
+
+    // Fallback for self-hosted search engines (SearXNG, Whoogle, etc.)
+    if (path === "/search" || path === "/web") {
+        for (const param of ["q", "query", "p", "text"]) {
+            if (url.searchParams.has(param)) return param;
+        }
+    }
+    return null;
+}
+
 function reverseDomain(domainStr) {
     let parts = domainStr.split('.');
     let firstPart = parts[0].toLowerCase();
@@ -39,6 +53,14 @@ function reverseDomain(domainStr) {
         parts[0] = customTLDs[firstPart];
     }
     return parts.reverse().join('.');
+}
+
+// Converts a standard URL (e.g. from "@") into a Top-Down target string
+function standardUrlToTopDown(urlStr) {
+    let parsed = new URL(urlStr);
+    let topDownDomain = parsed.hostname.toLowerCase().split('.').reverse().join('.');
+    let cleanPath = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/$/, "");
+    return topDownDomain + cleanPath + parsed.search + parsed.hash;
 }
 
 function parseTopDownTarget(targetStr) {
@@ -76,7 +98,6 @@ function joinPaths(basePath, extraPath) {
     return basePath + extraPath;
 }
 
-// Resolves a single expanded top-down target into a final destination or scoped search URL
 function resolveSingleTarget(rawTarget, extraPath, extraSearch, extraHash, searchContext) {
     let userParsed = parseTopDownTarget(rawTarget);
     let pathParts = userParsed.domain.split('/');
@@ -105,7 +126,6 @@ function resolveSingleTarget(rawTarget, extraPath, extraSearch, extraHash, searc
         return searchUrl.toString();
     }
 
-    // Ignore bare trailing-dot TLD queries (e.g. "edu.") when no search terms exist
     if (parsedExpanded.domain.endsWith('.')) return null;
 
     let finalUrl = new URL("https://" + standardDomain);
@@ -127,7 +147,6 @@ function resolveSingleTarget(rawTarget, extraPath, extraSearch, extraHash, searc
     return finalUrl.toString();
 }
 
-// Redirects current tab to the first resolved URL and spawns background tabs for the rest
 function dispatchUrls(resolvedUrls) {
     for (let i = 1; i < resolvedUrls.length; i++) {
         browser.tabs.create({ url: resolvedUrls[i], active: false });
@@ -147,7 +166,7 @@ browser.webRequest.onBeforeRequest.addListener(
 
         let url = new URL(details.url);
 
-        // CASE 1: Direct navigation (also decodes %7B / %7D in pathname for path braces like .r/{a,b})
+        // CASE 1: Direct navigation (decodes %7B / %7D in path, query, and hash)
         let decodeBraces = s => s.replace(/%7B/gi, '{').replace(/%7D/gi, '}');
         let rawDirectInput = url.hostname
             + (url.pathname === "/" ? "" : decodeBraces(url.pathname))
@@ -164,8 +183,8 @@ browser.webRequest.onBeforeRequest.addListener(
             return dispatchUrls(resolvedDirect);
         }
 
-        // CASE 2: Search engine query intercept (Navigation + Brace Expansion + Scoped Tree Search)
-        let searchParam = searchEngines[url.hostname];
+        // CASE 2: Universal Search Engine Intercept
+        let searchParam = getSearchParam(url);
         if (searchParam && url.searchParams.has(searchParam)) {
             let query = url.searchParams.get(searchParam).trim();
 
@@ -173,7 +192,52 @@ browser.webRequest.onBeforeRequest.addListener(
                 return;
             }
 
-            // Normalize spaces inside "{a, b}" first so we only split on whitespace outside braces
+            // INLINE MOUNT CREATION: Matches ".alias := target", ".alias := @", or ".alias :="
+            let assignMatch = query.match(/^(\.[a-zA-Z0-9_-]+)\s*:=\s*(.*)$/);
+            if (assignMatch) {
+                let mountKey = assignMatch[1].toLowerCase();
+                let rawTarget = assignMatch[2].trim();
+
+                // 1. Delete mount if right-hand side is empty (e.g. ".s :=")
+                if (rawTarget === "") {
+                    delete customMounts[mountKey];
+                    await browser.storage.local.set({ customMounts });
+                    return { redirectUrl: browser.runtime.getURL("options.html") };
+                }
+
+                // 2. Mount current active tab if right-hand side is "@" (e.g. ".go := @")
+                if (rawTarget === "@") {
+                    if (details.tabId !== -1) {
+                        let tab = await browser.tabs.get(details.tabId);
+                        if (tab && tab.url && tab.url.startsWith("http")) {
+                            customMounts[mountKey] = standardUrlToTopDown(tab.url);
+                            await browser.storage.local.set({ customMounts });
+                            return { redirectUrl: tab.url };
+                        }
+                    }
+                    return;
+                }
+
+                // 3. Standard inline assignment (e.g. ".s := .r/soccer" or ".s := com.reddit/r/soccer")
+                let cleanTarget = rawTarget.replace(/^https?:\/\//i, '').replace(/\/$/, '').toLowerCase();
+                if (isTopDown(cleanTarget, customMounts, customTLDs)) {
+                    customMounts[mountKey] = cleanTarget;
+                    await browser.storage.local.set({ customMounts });
+
+                    // Immediately resolve and navigate to the newly created mount
+                    let newCandidates = expandTargets(mountKey, customMounts);
+                    let resolvedNew = newCandidates
+                        .map(target => resolveSingleTarget(target, "", "", "", null))
+                        .filter(Boolean);
+
+                    if (resolvedNew.length > 0) {
+                        return dispatchUrls(resolvedNew);
+                    }
+                }
+                return;
+            }
+
+            // STANDARD QUERY PROCESSING (Navigation + Brace Expansion + Scoped Tree Search)
             let normalizedQuery = normalizeBraces(query);
             let spaceIdx = normalizedQuery.search(/\s/);
             let targetToken = spaceIdx === -1 ? normalizedQuery : normalizedQuery.slice(0, spaceIdx);
