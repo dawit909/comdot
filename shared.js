@@ -14,18 +14,63 @@ const defaultCustomTLDs = {
     "o": "org",
 };
 
+// Strips spaces around commas inside "{a, b}" so space-splitting won't break brace groups
+function normalizeBraces(str) {
+    if (!str || !str.includes('{')) return str;
+    return str.replace(/\{([^{}]*)\}/g, (match, inner) => {
+        if (!inner.includes(',')) return match;
+        return '{' + inner.split(',').map(s => s.trim()).filter(Boolean).join(',') + '}';
+    });
+}
+
+// Expands Unix brace expressions like ".google.{mail,calendar}" into an array of strings
+function expandBraces(str) {
+    if (!str || !str.includes('{')) return [str];
+
+    let results = [normalizeBraces(str)];
+    let braceRegex = /\{([^{}]*,[^{}]*)\}/;
+    const MAX_TABS = 20;
+
+    while (results.some(r => braceRegex.test(r)) && results.length < MAX_TABS) {
+        let nextResults = [];
+        for (let item of results) {
+            let match = item.match(braceRegex);
+            if (!match) {
+                nextResults.push(item);
+            } else {
+                let options = match[1].split(',').map(s => s.trim()).filter(Boolean);
+                for (let opt of options) {
+                    nextResults.push(item.slice(0, match.index) + opt + item.slice(match.index + match[0].length));
+                }
+            }
+        }
+        results = nextResults;
+    }
+
+    return results.slice(0, MAX_TABS);
+}
+
 // Unified Validation logic passed a dynamic map to resolve scope issues
 function isTopDown(hostLower, customMounts, customTLDsMap) {
-    if (!hostLower || hostLower.includes(' ') || hostLower === ".") return false;
+    if (!hostLower || hostLower === ".") return false;
+
+    // Support validating brace-expanded targets (e.g. in options.js)
+    if (hostLower.includes('{') && hostLower.includes('}')) {
+        let expandedList = expandBraces(hostLower);
+        return expandedList.length > 0 && expandedList.every(item => isTopDown(item, customMounts, customTLDsMap));
+    }
+
+    if (hostLower.includes(' ')) return false;
 
     // Strip out path, query (?), and fragment (#) to isolate the domain part
     let cleanHost = hostLower.split(/[\/\?#]/)[0];
     let parts = cleanHost.split('.');
+    if (parts.length < 2) return false;
 
     let firstPart = parts[0].toLowerCase();
     let lastPart = parts[parts.length - 1].toLowerCase();
 
-    if (firstPart === "" && parts[1] && customMounts && customMounts[parts[1]] !== undefined) return true;
+    if (firstPart === "" && parts[1] && customMounts && (customMounts[parts[1]] !== undefined || customMounts["." + parts[1]] !== undefined)) return true;
     if (customTLDsMap && customTLDsMap[firstPart] !== undefined) return true;
 
     if (superPrimaryTLDs.includes(lastPart)) return false;
@@ -36,40 +81,71 @@ function isTopDown(hostLower, customMounts, customTLDsMap) {
 }
 
 function expandCustomMounts(hostLower, customMounts) {
-    if (hostLower === "") return hostLower
+    if (hostLower === "") return hostLower;
 
-    let splitBySlash = hostLower.split("/")
-    let splitByDot = splitBySlash[0].split(".")
+    let splitBySlash = hostLower.split("/");
+    let splitByDot = splitBySlash[0].split(".");
     if (splitByDot.length === 0) return hostLower;
 
-    let first = splitByDot[0]
-    let second = splitByDot[1]
-    if (first !== "") return hostLower
+    let first = splitByDot[0];
+    let second = splitByDot[1];
+    if (first !== "") return hostLower;
 
-    let subdomains = splitByDot.slice(2)
-    let subpaths = splitBySlash.slice(1)
-    let subbed = ""
-    let beenawhile = false
-    while (first === "" && customMounts["." + second] && !(customMounts["." + second].includes("/") && subdomains.length > 0)) {
-        beenawhile = true
-        subbed = customMounts["." + second]
-        splitBySlash = subbed.split("/")
-        splitByDot = splitBySlash[0].split(".")
+    let subdomains = splitByDot.slice(2);
+    let subpaths = splitBySlash.slice(1);
+    let subbed = "";
+    let beenawhile = false;
 
-        subdomains.unshift(...splitBySlash[0].split(".").slice(2))
-        subpaths.unshift(...splitBySlash.slice(1))
+    while (first === "" && customMounts && customMounts["." + second] && !(customMounts["." + second].includes("/") && subdomains.length > 0)) {
+        let candidate = customMounts["." + second];
 
-        first = splitByDot[0]
-        second = splitByDot[1]
+        // If the mount target itself is a brace expression (e.g. .morning -> {.r/soccer, .github}),
+        // replace the mount key directly and let expandTargets() unpack the braces next.
+        if (candidate.includes('{')) {
+            let subStr = subdomains.length === 0 ? "" : "." + subdomains.join(".");
+            let pathStr = subpaths.length === 0 ? "" : "/" + subpaths.join("/");
+            return candidate + subStr + pathStr;
+        }
+
+        beenawhile = true;
+        subbed = candidate;
+        splitBySlash = subbed.split("/");
+        splitByDot = splitBySlash[0].split(".");
+
+        subdomains.unshift(...splitBySlash[0].split(".").slice(2));
+        subpaths.unshift(...splitBySlash.slice(1));
+
+        first = splitByDot[0];
+        second = splitByDot[1];
     }
 
     if (!beenawhile) {
-        return hostLower
+        return hostLower;
     }
-    let subdomainsStr = (subdomains.length === 0 ? "" : "." + subdomains.join("."))
-    let pathsStr = (subpaths.length === 0 ? "" : "/" + subpaths.join("/"))
+    let subdomainsStr = (subdomains.length === 0 ? "" : "." + subdomains.join("."));
+    let pathsStr = (subpaths.length === 0 ? "" : "/" + subpaths.join("/"));
 
-    first = subbed.split("/")[0].split(".")[0]
-    second = subbed.split("/")[0].split(".")[1]
-    return first + "." + second + subdomainsStr + pathsStr
+    first = subbed.split("/")[0].split(".")[0];
+    second = subbed.split("/")[0].split(".")[1];
+    return first + "." + second + subdomainsStr + pathsStr;
+}
+
+// Interleaves brace expansion and custom mount expansion until fully resolved
+function expandTargets(rawInput, customMounts) {
+    let queue = [rawInput];
+    for (let depth = 0; depth < 5; depth++) {
+        let nextQueue = [];
+        let changed = false;
+
+        for (let item of queue) {
+            for (let braced of expandBraces(item)) {
+                let mounted = expandCustomMounts(braced, customMounts);
+                if (mounted !== item) changed = true;
+                nextQueue.push(mounted);
+            }
+        }
+        queue = nextQueue;
+        if (!changed && !queue.some(x => /\{[^{}]*,[^{}]*\}/.test(x))) break;
+    }
+    return queue;
 }
