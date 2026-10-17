@@ -148,12 +148,16 @@ browser.webRequest.onBeforeRequest.addListener(
         let url = new URL(details.url);
 
         // CASE 1: Direct navigation (also decodes %7B / %7D in pathname for path braces like .r/{a,b})
-        let decodedPathname = url.pathname.replace(/%7B/gi, '{').replace(/%7D/gi, '}');
-        let rawDirectInput = url.hostname + (decodedPathname === "/" ? "" : decodedPathname);
+        let decodeBraces = s => s.replace(/%7B/gi, '{').replace(/%7D/gi, '}');
+        let rawDirectInput = url.hostname
+            + (url.pathname === "/" ? "" : decodeBraces(url.pathname))
+            + decodeBraces(url.search)
+            + decodeBraces(url.hash);
+
         let directCandidates = expandTargets(rawDirectInput, customMounts);
 
         let resolvedDirect = directCandidates
-            .map(target => resolveSingleTarget(target, "", url.search, url.hash, null))
+            .map(target => resolveSingleTarget(target, "", "", "", null))
             .filter(Boolean);
 
         if (resolvedDirect.length > 0 && resolvedDirect.length === directCandidates.length) {

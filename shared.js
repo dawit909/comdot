@@ -14,35 +14,123 @@ const defaultCustomTLDs = {
     "o": "org",
 };
 
-// Strips spaces around commas inside "{a, b}" so space-splitting won't break brace groups
+const BRACE_REGEX = /\{([^{}]*(?:,|\.\.)[^{}]*)\}/;
+const MAX_TABS = 20;
+
+// Strips spaces inside "{a, b}" or "{25, 50..100}" so space-splitting won't break brace groups
 function normalizeBraces(str) {
     if (!str || !str.includes('{')) return str;
     return str.replace(/\{([^{}]*)\}/g, (match, inner) => {
-        if (!inner.includes(',')) return match;
-        return '{' + inner.split(',').map(s => s.trim()).filter(Boolean).join(',') + '}';
+        if (!inner.includes(',') && !inner.includes('..')) return match;
+        return '{' + inner.replace(/\s*,\s*/g, ',').replace(/\s*\.\.\s*/g, '..').trim() + '}';
     });
 }
 
-// Expands Unix brace expressions like ".google.{mail,calendar}" into an array of strings
+// Parses a single brace group's inner content into an array of expanded values
+function parseBraceGroup(inner) {
+    // 1. Numeric ranges: {1..5}, {25..100..25}, or {25,50..100}
+    let numStepMatch = inner.match(/^(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?$/);
+    let numSeriesMatch = !numStepMatch && inner.match(/^(-?\d+),(-?\d+)\.\.(-?\d+)$/);
+
+    if (numStepMatch || numSeriesMatch) {
+        let startStr = numStepMatch ? numStepMatch[1] : numSeriesMatch[1];
+        let endStr = numStepMatch ? numStepMatch[2] : numSeriesMatch[3];
+        let start = Number(startStr);
+        let end = Number(endStr);
+
+        let step = 1;
+        if (numStepMatch && numStepMatch[3] !== undefined) {
+            step = Math.abs(Number(numStepMatch[3]));
+        } else if (numSeriesMatch) {
+            step = Math.abs(Number(numSeriesMatch[2]) - start);
+        }
+
+        if (step === 0) return [inner];
+
+        let padLength = (startStr.replace('-', '').startsWith('0') && startStr.replace('-', '').length > 1)
+            ? Math.max(startStr.replace('-', '').length, endStr.replace('-', '').length)
+            : 0;
+
+        let values = [];
+        let dir = start <= end ? 1 : -1;
+
+        for (let val = start; dir > 0 ? val <= end : val >= end; val += dir * step) {
+            if (values.length >= MAX_TABS) break;
+            let formatted = padLength > 0
+                ? (val < 0 ? '-' : '') + String(Math.abs(val)).padStart(padLength, '0')
+                : String(val);
+            values.push(formatted);
+        }
+
+        return values.length > 0 ? values : [inner];
+    }
+
+    // 2. Alphabetical ranges: {a..e}, {a..z..2}, or {a,c..k}
+    let alphaStepMatch = inner.match(/^([a-zA-Z])\.\.([a-zA-Z])(?:\.\.(-?\d+))?$/);
+    let alphaSeriesMatch = !alphaStepMatch && inner.match(/^([a-zA-Z]),([a-zA-Z])\.\.([a-zA-Z])$/);
+
+    if (alphaStepMatch || alphaSeriesMatch) {
+        let startChar = alphaStepMatch ? alphaStepMatch[1] : alphaSeriesMatch[1];
+        let endChar = alphaStepMatch ? alphaStepMatch[2] : alphaSeriesMatch[3];
+
+        // Require matching case so ranges don't step through ASCII symbols (91–96) between 'Z' and 'a'
+        let isLower = c => c >= 'a' && c <= 'z';
+        let sameCase = (isLower(startChar) === isLower(endChar)) &&
+            (!alphaSeriesMatch || isLower(alphaSeriesMatch[2]) === isLower(startChar));
+
+        if (sameCase) {
+            let start = startChar.charCodeAt(0);
+            let end = endChar.charCodeAt(0);
+
+            let step = 1;
+            if (alphaStepMatch && alphaStepMatch[3] !== undefined) {
+                step = Math.abs(Number(alphaStepMatch[3]));
+            } else if (alphaSeriesMatch) {
+                step = Math.abs(alphaSeriesMatch[2].charCodeAt(0) - start);
+            }
+
+            if (step === 0) return [inner];
+
+            let values = [];
+            let dir = start <= end ? 1 : -1;
+
+            for (let code = start; dir > 0 ? code <= end : code >= end; code += dir * step) {
+                if (values.length >= MAX_TABS) break;
+                values.push(String.fromCharCode(code));
+            }
+
+            return values.length > 0 ? values : [inner];
+        }
+    }
+
+    // 3. Standard comma-separated list: {a,b,c}
+    if (inner.includes(',')) {
+        return inner.split(',').map(s => s.trim()).filter(Boolean);
+    }
+
+    return [inner];
+}
+
+// Expands Unix brace expressions into an array of strings
 function expandBraces(str) {
     if (!str || !str.includes('{')) return [str];
 
     let results = [normalizeBraces(str)];
-    let braceRegex = /\{([^{}]*,[^{}]*)\}/;
-    const MAX_TABS = 20;
 
-    while (results.some(r => braceRegex.test(r)) && results.length < MAX_TABS) {
+    while (results.some(r => BRACE_REGEX.test(r)) && results.length < MAX_TABS) {
         let nextResults = [];
         for (let item of results) {
-            let match = item.match(braceRegex);
+            let match = item.match(BRACE_REGEX);
             if (!match) {
                 nextResults.push(item);
             } else {
-                let options = match[1].split(',').map(s => s.trim()).filter(Boolean);
+                let options = parseBraceGroup(match[1]);
                 for (let opt of options) {
                     nextResults.push(item.slice(0, match.index) + opt + item.slice(match.index + match[0].length));
+                    if (nextResults.length >= MAX_TABS) break;
                 }
             }
+            if (nextResults.length >= MAX_TABS) break;
         }
         results = nextResults;
     }
@@ -145,7 +233,7 @@ function expandTargets(rawInput, customMounts) {
             }
         }
         queue = nextQueue;
-        if (!changed && !queue.some(x => /\{[^{}]*,[^{}]*\}/.test(x))) break;
+        if (!changed && !queue.some(x => BRACE_REGEX.test(x))) break;
     }
     return queue;
 }
